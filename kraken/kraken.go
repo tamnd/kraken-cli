@@ -1,59 +1,82 @@
 // Package kraken is the library behind the kraken command line:
-// the HTTP client, request shaping, and the typed data models for kraken.
+// the HTTP client, request shaping, and the typed data models for the
+// Kraken crypto exchange public API (api.kraken.com/0/public).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client is the spine every command shares. It sets a real User-Agent,
+// paces requests so a busy session stays polite, and retries transient
+// failures (429 and 5xx). Build your endpoint calls and JSON decoding on
+// top of Get.
 package kraken
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to kraken. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to Kraken.
 const DefaultUserAgent = "kraken/dev (+https://github.com/tamnd/kraken-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at kraken.com; change it once you
-// know the real endpoints you want to read.
-const Host = "kraken.com"
+// Host is the Kraken public API host.
+const Host = "api.kraken.com"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://" + Host + "/0/public"
 
-// Client talks to kraken over HTTP.
+// Config holds optional overrides a caller can apply to a new Client.
+type Config struct {
+	UserAgent string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
+}
+
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		UserAgent: DefaultUserAgent,
+		Rate:      200 * time.Millisecond,
+		Retries:   5,
+		Timeout:   30 * time.Second,
+	}
+}
+
+// Client talks to Kraken over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
+	// Base overrides BaseURL for testing. Leave empty to use BaseURL.
+	Base string
 
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+func (c *Client) base() string {
+	if c.Base != "" {
+		return c.Base
+	}
+	return BaseURL
+}
+
+// Get fetches url and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -123,48 +146,148 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on kraken.com. It is a stand-in for the typed records you
-// will model from the real kraken endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `kraken cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- output types ---
+
+// Ticker holds the current price summary for an asset pair.
+type Ticker struct {
+	Pair    string  `kit:"id" json:"pair"`
+	Price   string  `json:"price"`    // c[0] = last trade price
+	High24h string  `json:"high_24h"` // h[1]
+	Low24h  string  `json:"low_24h"`  // l[1]
+	Volume  string  `json:"volume"`   // v[1]
+	Trades  float64 `json:"trades"`   // t[1]
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+// Asset describes a single Kraken asset (currency).
+type Asset struct {
+	ID       string `kit:"id" json:"id"`
+	AltName  string `json:"alt_name"`
+	Decimals int    `json:"decimals"`
+	Status   string `json:"status"`
+}
+
+// Pair describes a Kraken tradeable asset pair.
+type Pair struct {
+	ID      string `kit:"id" json:"id"`
+	AltName string `json:"alt_name"`
+	Base    string `json:"base"`
+	Quote   string `json:"quote"`
+	Status  string `json:"status"`
+}
+
+// Candle is one OHLC bar.
+type Candle struct {
+	Pair   string `kit:"id" json:"pair"`
+	Time   int64  `json:"time"`
+	Open   string `json:"open"`
+	High   string `json:"high"`
+	Low    string `json:"low"`
+	Close  string `json:"close"`
+	VWAP   string `json:"vwap"`
+	Volume string `json:"volume"`
+	Count  int    `json:"count"`
+}
+
+// --- API response helpers ---
+
+// krakenResp is the envelope every Kraken public endpoint returns.
+type krakenResp struct {
+	Error  []string        `json:"error"`
+	Result json.RawMessage `json:"result"`
+}
+
+// decode unmarshals a Kraken response envelope from body. If the API
+// returned error strings, the first one is returned as an error.
+func decode(body []byte) (json.RawMessage, error) {
+	var r krakenResp
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	if len(r.Error) > 0 {
+		return nil, fmt.Errorf("kraken API error: %s", r.Error[0])
+	}
+	return r.Result, nil
+}
+
+// --- Ticker ---
+
+// GetTicker fetches the current ticker for a pair (e.g. "XBTUSD").
+func (c *Client) GetTicker(ctx context.Context, pair string) (*Ticker, error) {
+	url := c.base() + "/Ticker?pair=" + pair
 	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
+	result, err := decode(body)
 	if err != nil {
 		return nil, err
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+
+	// result is a map keyed by the internal pair name e.g. "XXBTZUSD"
+	var m map[string]struct {
+		C []string  `json:"c"` // [price, lot]
+		H []string  `json:"h"` // [today, 24h]
+		L []string  `json:"l"` // [today, 24h]
+		V []string  `json:"v"` // [today, 24h]
+		T []float64 `json:"t"` // [today, 24h]
+	}
+	if err := json.Unmarshal(result, &m); err != nil {
+		return nil, fmt.Errorf("parse ticker: %w", err)
+	}
+
+	for key, v := range m {
+		t := &Ticker{Pair: key}
+		if len(v.C) > 0 {
+			t.Price = v.C[0]
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
+		if len(v.H) > 1 {
+			t.High24h = v.H[1]
+		}
+		if len(v.L) > 1 {
+			t.Low24h = v.L[1]
+		}
+		if len(v.V) > 1 {
+			t.Volume = v.V[1]
+		}
+		if len(v.T) > 1 {
+			t.Trades = v.T[1]
+		}
+		return t, nil
+	}
+	return nil, fmt.Errorf("ticker: empty result")
+}
+
+// --- Assets ---
+
+// GetAssets fetches all assets, optionally limited to limit items (0 = all).
+func (c *Client) GetAssets(ctx context.Context, limit int) ([]*Asset, error) {
+	url := c.base() + "/Assets"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	result, err := decode(body)
+	if err != nil {
+		return nil, err
+	}
+
+	var m map[string]struct {
+		AltName  string `json:"altname"`
+		Decimals int    `json:"decimals"`
+		Status   string `json:"status"`
+	}
+	if err := json.Unmarshal(result, &m); err != nil {
+		return nil, fmt.Errorf("parse assets: %w", err)
+	}
+
+	var out []*Asset
+	for key, v := range m {
+		out = append(out, &Asset{
+			ID:       key,
+			AltName:  v.AltName,
+			Decimals: v.Decimals,
+			Status:   v.Status,
+		})
 		if limit > 0 && len(out) >= limit {
 			break
 		}
@@ -172,29 +295,127 @@ func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- Pairs ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// GetPairs fetches asset pairs. If pairs is non-empty it is passed as the
+// "pair" query parameter (comma-separated). Optionally limited to limit items.
+func (c *Client) GetPairs(ctx context.Context, pairs string, limit int) ([]*Pair, error) {
+	u := c.base() + "/AssetPairs"
+	if pairs != "" {
+		u += "?pair=" + pairs
+	}
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	result, err := decode(body)
+	if err != nil {
+		return nil, err
+	}
+
+	var m map[string]struct {
+		AltName string `json:"altname"`
+		Base    string `json:"base"`
+		Quote   string `json:"quote"`
+		Status  string `json:"status"`
+	}
+	if err := json.Unmarshal(result, &m); err != nil {
+		return nil, fmt.Errorf("parse pairs: %w", err)
+	}
+
+	var out []*Pair
+	for key, v := range m {
+		out = append(out, &Pair{
+			ID:      key,
+			AltName: v.AltName,
+			Base:    v.Base,
+			Quote:   v.Quote,
+			Status:  v.Status,
+		})
+		if limit > 0 && len(out) >= limit {
+			break
 		}
 	}
-	return out
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// --- OHLC ---
+
+// GetOHLC fetches OHLC candles for a pair. interval is in minutes
+// (1|5|15|60|1440). limit caps the number of returned candles (0 = all).
+func (c *Client) GetOHLC(ctx context.Context, pair string, interval, limit int) ([]*Candle, error) {
+	if interval <= 0 {
+		interval = 1440
 	}
-	return s
+	u := fmt.Sprintf("%s/OHLC?pair=%s&interval=%d", c.base(), pair, interval)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	result, err := decode(body)
+	if err != nil {
+		return nil, err
+	}
+
+	// result is a map: {"XXBTZUSD": [[...], ...], "last": N}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(result, &raw); err != nil {
+		return nil, fmt.Errorf("parse ohlc map: %w", err)
+	}
+
+	var pairKey string
+	var rowsRaw json.RawMessage
+	for k, v := range raw {
+		if k == "last" {
+			continue
+		}
+		pairKey = k
+		rowsRaw = v
+		break
+	}
+	if pairKey == "" {
+		return nil, fmt.Errorf("ohlc: no pair key in result")
+	}
+
+	var rows [][]interface{}
+	if err := json.Unmarshal(rowsRaw, &rows); err != nil {
+		return nil, fmt.Errorf("parse ohlc rows: %w", err)
+	}
+
+	var out []*Candle
+	for _, row := range rows {
+		if len(row) < 8 {
+			continue
+		}
+		candle := &Candle{Pair: pairKey}
+		if v, ok := row[0].(float64); ok {
+			candle.Time = int64(v)
+		}
+		if v, ok := row[1].(string); ok {
+			candle.Open = v
+		}
+		if v, ok := row[2].(string); ok {
+			candle.High = v
+		}
+		if v, ok := row[3].(string); ok {
+			candle.Low = v
+		}
+		if v, ok := row[4].(string); ok {
+			candle.Close = v
+		}
+		if v, ok := row[5].(string); ok {
+			candle.VWAP = v
+		}
+		if v, ok := row[6].(string); ok {
+			candle.Volume = v
+		}
+		if v, ok := row[7].(float64); ok {
+			candle.Count = int(v)
+		}
+		out = append(out, candle)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
